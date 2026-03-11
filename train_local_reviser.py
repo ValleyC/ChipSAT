@@ -455,6 +455,7 @@ def run_condition(
     )
 
     n_iters = n_improved = n_infeasible = 0
+    total_branches = total_conflicts = total_solver_wall = 0.0
     rng = np.random.default_rng(seed + 1)
     t0 = time.time()
 
@@ -464,20 +465,16 @@ def run_condition(
         solver.strategy_attempts[strategy] += 1
         pre_pos  = solver.current_pos.copy()
 
-        if condition == 'pure':
-            new_pos = solve_subset(
-                solver.current_pos, sizes, nets, subset,
-                time_limit=cpsat_time_limit,
-                window_fraction=window_fraction,
-            )
-        else:
+        # All conditions go through solve_subset_guided so we get uniform telemetry.
+        # pure: no hints, no per-macro windows → identical to solve_subset().
+        hint_pos       = None
+        per_macro_wins = None
+
+        if condition != 'pure':
             inst = extract_local_instance(
                 pre_pos, pre_pos,  # post=pre: targets unused at inference time
                 subset, sizes, nets, window_fraction,
             )
-
-            hint_pos       = None
-            per_macro_wins = None
 
             if condition in ('hint_only', 'hint_plus_trust') and model is not None:
                 disp_local, trust_local = _gnn_inference(model, inst, device)
@@ -493,7 +490,6 @@ def run_condition(
 
             elif condition == 'trust_only' and model is not None:
                 _, trust_local = _gnn_inference(model, inst, device)
-                # hint_pos=None → domain centered at current position (correct for trust_only)
                 per_macro_wins = np.full(len(pre_pos), window_fraction, dtype=np.float64)
                 for k, gidx in enumerate(subset):
                     per_macro_wins[gidx] = float(trust_local[k]) * window_fraction
@@ -505,14 +501,17 @@ def run_condition(
                     hint_pos[gidx, 0] = pre_pos[gidx, 0] + noise[k, 0]
                     hint_pos[gidx, 1] = pre_pos[gidx, 1] + noise[k, 1]
 
-            res_guided = solve_subset_guided(
-                solver.current_pos, sizes, nets, subset,
-                time_limit=cpsat_time_limit,
-                window_fraction=window_fraction,
-                hint_positions=hint_pos,
-                per_macro_windows=per_macro_wins,
-            )
-            new_pos = res_guided['new_positions']
+        res_guided = solve_subset_guided(
+            solver.current_pos, sizes, nets, subset,
+            time_limit=cpsat_time_limit,
+            window_fraction=window_fraction,
+            hint_positions=hint_pos,
+            per_macro_windows=per_macro_wins,
+        )
+        new_pos = res_guided['new_positions']
+        total_branches    += res_guided.get('branches', 0)
+        total_conflicts   += res_guided.get('conflicts', 0)
+        total_solver_wall += res_guided.get('solver_wall_time', 0.0)
 
         result = solver._apply_candidate_result(new_pos, subset, strategy, pre_pos)
         n_iters += 1
@@ -522,13 +521,18 @@ def run_condition(
             n_infeasible += 1
 
     elapsed = time.time() - t0
+    n_feasible = max(n_iters - n_infeasible, 1)
     return {
-        'condition':    condition,
-        'best_hpwl':    solver.best_hpwl,
-        'n_iters':      n_iters,
-        'n_improved':   n_improved,
-        'n_infeasible': n_infeasible,
-        'elapsed_s':    elapsed,
+        'condition':          condition,
+        'best_hpwl':          solver.best_hpwl,
+        'n_iters':            n_iters,
+        'n_improved':         n_improved,
+        'n_infeasible':       n_infeasible,
+        'elapsed_s':          elapsed,
+        'branches_per_call':  total_branches    / n_feasible,
+        'conflicts_per_call': total_conflicts   / n_feasible,
+        'solver_ms_per_call': total_solver_wall / n_feasible * 1000,
+        'impr_per_s':         n_improved / max(elapsed, 1e-8),
     }
 
 
@@ -587,17 +591,22 @@ def eval_mode(args):
         results.append(r)
         print(f"  HPWL={r['best_hpwl']:.4f} ({r['ratio_vs_ref']:.3f}x ref)  "
               f"iters={r['n_iters']} improved={r['n_improved']} "
-              f"infeas={r['n_infeasible']}")
+              f"infeas={r['n_infeasible']}  "
+              f"branches/call={r['branches_per_call']:.1f}  "
+              f"solver_ms/call={r['solver_ms_per_call']:.1f}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*90}")
     print(f"5-CONDITION ABLATION: {args.circuit} ({args.wall_clock}s per condition)")
-    print(f"{'='*70}")
-    hdr = f"{'Condition':<20} {'HPWL':>8} {'Ratio':>7} {'Iters':>7} {'Impr':>6} {'Infeas':>7}"
+    print(f"{'='*90}")
+    hdr = (f"{'Condition':<20} {'HPWL':>8} {'Ratio':>7} {'Iters':>7} {'Impr':>6} "
+           f"{'Infeas':>7} {'Branch/c':>9} {'Conf/c':>7} {'ms/c':>7} {'Impr/s':>7}")
     print(hdr)
     print('-' * len(hdr))
     for r in results:
         print(f"{r['condition']:<20} {r['best_hpwl']:8.4f} {r['ratio_vs_ref']:7.3f}x "
-              f"{r['n_iters']:7d} {r['n_improved']:6d} {r['n_infeasible']:7d}")
+              f"{r['n_iters']:7d} {r['n_improved']:6d} {r['n_infeasible']:7d} "
+              f"{r['branches_per_call']:9.1f} {r['conflicts_per_call']:7.1f} "
+              f"{r['solver_ms_per_call']:7.1f} {r['impr_per_s']:7.3f}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     out_path = os.path.join(args.save_dir, f'ablation_{args.circuit}.json')
