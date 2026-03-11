@@ -395,7 +395,7 @@ def train(args):
     if not os.path.exists(data_path):
         print(f"ERROR: no data at {data_path} — run --mode collect first")
         return
-    instances = torch.load(data_path)
+    instances = torch.load(data_path, weights_only=False)
     print(f"Loaded {len(instances)} instances")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
