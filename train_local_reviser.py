@@ -247,6 +247,8 @@ def _collect_one_circuit(job):
 
     _, ov_pairs = check_overlap(positions, sizes)
     if ov_pairs > 0:
+        print(f"  [{circuit_name} s{seed}] Legalizing ({ov_pairs} overlapping pairs)...",
+              flush=True)
         legal_pos = legalize(
             positions, sizes, time_limit=60.0,
             window_fraction=0.3, num_workers=4)
@@ -255,6 +257,8 @@ def _collect_one_circuit(job):
         positions = legal_pos
 
     initial_hpwl = compute_net_hpwl(positions, sizes, nets)
+    print(f"  [{circuit_name} s{seed}] N={N} initial_hpwl={initial_hpwl:.4f} — starting ALNS",
+          flush=True)
 
     solver = LNSSolver(
         positions=positions, sizes=sizes, nets=nets, edge_index=edge_index,
@@ -287,6 +291,11 @@ def _collect_one_circuit(job):
             inst['circuit'] = circuit_name
             inst['seed']    = seed
             instances.append(inst)
+
+        if (it + 1) % 200 == 0:
+            print(f"  [{circuit_name} s{seed}] iter {it+1}/{n_iterations} "
+                  f"hpwl={solver.best_hpwl:.4f} collected={len(instances)}",
+                  flush=True)
 
     elapsed = time.time() - t0
     msg = (f"N={N} iters={n_iterations} in {elapsed:.1f}s "
