@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -227,82 +228,102 @@ def _gnn_inference(model, inst, device):
 
 # ─────────────────────────────── Collect mode ─────────────────────────────────
 
+def _collect_one_circuit(job):
+    """Module-level worker: collect instances from one (circuit, seed) pair."""
+    (circuit_name, seed, benchmark_base, subset_size,
+     window_fraction, cpsat_time_limit, n_iterations) = job
+
+    circuit_dir = os.path.join(benchmark_base, 'iccad04', 'extracted', circuit_name)
+    data = load_bookshelf_circuit(
+        circuit_dir, circuit_name, macros_only=True, seed=seed)
+
+    positions  = data['positions']
+    sizes      = data['node_features']
+    nets       = data['nets']
+    edge_index = data['edge_index']
+    N          = data['n_components']
+
+    _, ov_pairs = check_overlap(positions, sizes)
+    if ov_pairs > 0:
+        legal_pos = legalize(
+            positions, sizes, time_limit=60.0,
+            window_fraction=0.3, num_workers=4)
+        if legal_pos is None:
+            return circuit_name, seed, [], f"legalization failed"
+        positions = legal_pos
+
+    initial_hpwl = compute_net_hpwl(positions, sizes, nets)
+
+    solver = LNSSolver(
+        positions=positions, sizes=sizes, nets=nets, edge_index=edge_index,
+        congestion_weight=0.0, subset_size=subset_size,
+        window_fraction=window_fraction, cpsat_time_limit=cpsat_time_limit,
+        plateau_threshold=20, adapt_threshold=30, seed=seed,
+    )
+
+    instances = []
+    t0 = time.time()
+    for it in range(n_iterations):
+        strategy = solver.select_strategy()
+        subset   = solver.get_neighborhood(strategy, solver.subset_size)
+        solver.strategy_attempts[strategy] += 1
+        pre_pos  = solver.current_pos.copy()
+
+        new_pos = solve_subset(
+            solver.current_pos, solver.sizes, solver.nets, subset,
+            time_limit=solver.cpsat_time_limit,
+            window_fraction=solver.window_fraction,
+        )
+        result = solver._apply_candidate_result(new_pos, subset, strategy, pre_pos)
+
+        if result['accepted'] and result['delta_cost'] < -1e-8 and new_pos is not None:
+            inst = extract_local_instance(
+                pre_pos, solver.current_pos,
+                subset, sizes, nets, solver.window_fraction,
+            )
+            inst['weight']  = float(-result['delta_cost']) / max(initial_hpwl, 1e-8)
+            inst['circuit'] = circuit_name
+            inst['seed']    = seed
+            instances.append(inst)
+
+    elapsed = time.time() - t0
+    msg = (f"N={N} iters={n_iterations} in {elapsed:.1f}s "
+           f"— {len(instances)} instances | best HPWL: {solver.best_hpwl:.4f}")
+    return circuit_name, seed, instances, msg
+
+
 def collect(args):
     os.makedirs(args.data_dir, exist_ok=True)
+
+    seeds = list(range(args.seed, args.seed + args.n_seeds))
+    jobs = [
+        (circuit_name, seed,
+         args.benchmark_base, args.subset_size,
+         args.window_fraction, args.cpsat_time_limit, args.n_iterations)
+        for circuit_name in args.circuits
+        for seed in seeds
+    ]
+    print(f"Collect: {len(args.circuits)} circuits × {args.n_seeds} seeds "
+          f"= {len(jobs)} jobs  (n_workers={args.n_workers})")
+
     all_instances = []
 
-    for circuit_name in args.circuits:
-        print(f"\n=== Collecting from {circuit_name} ===")
-        circuit_dir = os.path.join(
-            args.benchmark_base, 'iccad04', 'extracted', circuit_name)
-        data = load_bookshelf_circuit(
-            circuit_dir, circuit_name, macros_only=True, seed=args.seed)
-
-        positions  = data['positions']
-        sizes      = data['node_features']
-        nets       = data['nets']
-        edge_index = data['edge_index']
-        N          = data['n_components']
-
-        _, ov_pairs = check_overlap(positions, sizes)
-        if ov_pairs > 0:
-            print(f"  Legalizing ({ov_pairs} overlapping pairs)...")
-            legal_pos = legalize(
-                positions, sizes, time_limit=60.0,
-                window_fraction=0.3, num_workers=4)
-            if legal_pos is None:
-                print(f"  WARNING: legalization failed, skipping {circuit_name}")
-                continue
-            positions = legal_pos
-
-        initial_hpwl = compute_net_hpwl(positions, sizes, nets)
-        print(f"  N={N}, nets={len(nets)}, initial HPWL={initial_hpwl:.4f}")
-
-        solver = LNSSolver(
-            positions=positions,
-            sizes=sizes,
-            nets=nets,
-            edge_index=edge_index,
-            congestion_weight=0.0,
-            subset_size=args.subset_size,
-            window_fraction=args.window_fraction,
-            cpsat_time_limit=args.cpsat_time_limit,
-            plateau_threshold=20,
-            adapt_threshold=30,
-            seed=args.seed,
-        )
-
-        n_collected = 0
-        t0 = time.time()
-
-        for it in range(args.n_iterations):
-            strategy = solver.select_strategy()
-            subset   = solver.get_neighborhood(strategy, solver.subset_size)
-            solver.strategy_attempts[strategy] += 1
-            pre_pos  = solver.current_pos.copy()
-
-            new_pos = solve_subset(
-                solver.current_pos, solver.sizes, solver.nets, subset,
-                time_limit=solver.cpsat_time_limit,
-                window_fraction=solver.window_fraction,
-            )
-            result = solver._apply_candidate_result(new_pos, subset, strategy, pre_pos)
-
-            # Only collect strictly improving accepted moves
-            if result['accepted'] and result['delta_cost'] < -1e-8 and new_pos is not None:
-                inst = extract_local_instance(
-                    pre_pos, solver.current_pos,
-                    subset, sizes, nets,
-                    solver.window_fraction,
-                )
-                inst['weight']  = float(-result['delta_cost']) / max(initial_hpwl, 1e-8)
-                inst['circuit'] = circuit_name
-                all_instances.append(inst)
-                n_collected += 1
-
-        elapsed = time.time() - t0
-        print(f"  {it+1} iters in {elapsed:.1f}s — {n_collected} instances collected"
-              f" | best HPWL: {solver.best_hpwl:.4f}")
+    if args.n_workers == 1:
+        for job in jobs:
+            circuit_name, seed, instances, msg = _collect_one_circuit(job)
+            print(f"  [{circuit_name} seed={seed}] {msg}")
+            all_instances.extend(instances)
+    else:
+        with ProcessPoolExecutor(max_workers=args.n_workers) as executor:
+            futures = {executor.submit(_collect_one_circuit, job): job for job in jobs}
+            for future in as_completed(futures):
+                try:
+                    circuit_name, seed, instances, msg = future.result()
+                    print(f"  [{circuit_name} seed={seed}] {msg}", flush=True)
+                    all_instances.extend(instances)
+                except Exception as e:
+                    job = futures[future]
+                    print(f"  ERROR [{job[0]} seed={job[1]}]: {e}", flush=True)
 
     out_path = os.path.join(args.data_dir, 'instances.pt')
     torch.save(all_instances, out_path)
@@ -606,7 +627,11 @@ def main():
     parser.add_argument('--window_fraction',  type=float, default=BEST_WF)
     parser.add_argument('--cpsat_time_limit', type=float, default=BEST_TL)
     parser.add_argument('--n_iterations',     type=int,   default=2000,
-                        help='ALNS iterations per circuit in collect mode')
+                        help='ALNS iterations per (circuit, seed) in collect mode')
+    parser.add_argument('--n_seeds',          type=int,   default=1,
+                        help='Number of independent seeds per circuit (more diverse data)')
+    parser.add_argument('--n_workers',        type=int,   default=1,
+                        help='Parallel collect workers; each uses 4 CP-SAT threads')
 
     # Model
     parser.add_argument('--hidden_dim', type=int, default=64)
