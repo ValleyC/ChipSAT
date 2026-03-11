@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import time
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -314,7 +315,8 @@ def collect(args):
             print(f"  [{circuit_name} seed={seed}] {msg}")
             all_instances.extend(instances)
     else:
-        with ProcessPoolExecutor(max_workers=args.n_workers) as executor:
+        with ProcessPoolExecutor(max_workers=args.n_workers,
+                                 mp_context=mp.get_context('spawn')) as executor:
             futures = {executor.submit(_collect_one_circuit, job): job for job in jobs}
             for future in as_completed(futures):
                 try:
