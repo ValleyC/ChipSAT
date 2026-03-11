@@ -29,8 +29,9 @@ import json
 import os
 import sys
 import time
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -293,39 +294,74 @@ def _collect_one_circuit(job):
     return circuit_name, seed, instances, msg
 
 
+def _run_subprocess_job(job_info):
+    """Thread worker: launch one collect subprocess, wait for it, load results."""
+    circuit_name, seed, tmp_dir, cmd = job_info
+    # stdout inherited (live progress to terminal); stderr captured for error reporting
+    proc = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    inst_path = os.path.join(tmp_dir, 'instances.pt')
+    if proc.returncode != 0:
+        return circuit_name, seed, [], f"FAILED rc={proc.returncode}: {proc.stderr[-300:]}"
+    if os.path.exists(inst_path):
+        instances = torch.load(inst_path, weights_only=False)
+        return circuit_name, seed, instances, f"{len(instances)} instances"
+    return circuit_name, seed, [], "no output file"
+
+
 def collect(args):
     os.makedirs(args.data_dir, exist_ok=True)
 
     seeds = list(range(args.seed, args.seed + args.n_seeds))
-    jobs = [
-        (circuit_name, seed,
-         args.benchmark_base, args.subset_size,
-         args.window_fraction, args.cpsat_time_limit, args.n_iterations)
-        for circuit_name in args.circuits
-        for seed in seeds
-    ]
+    job_pairs = [(c, s) for c in args.circuits for s in seeds]
+
     print(f"Collect: {len(args.circuits)} circuits × {args.n_seeds} seeds "
-          f"= {len(jobs)} jobs  (n_workers={args.n_workers})")
+          f"= {len(job_pairs)} jobs  (n_workers={args.n_workers})")
 
     all_instances = []
 
     if args.n_workers == 1:
-        for job in jobs:
+        for circuit_name, seed in job_pairs:
+            job = (circuit_name, seed, args.benchmark_base, args.subset_size,
+                   args.window_fraction, args.cpsat_time_limit, args.n_iterations)
             circuit_name, seed, instances, msg = _collect_one_circuit(job)
             print(f"  [{circuit_name} seed={seed}] {msg}")
             all_instances.extend(instances)
     else:
-        with ProcessPoolExecutor(max_workers=args.n_workers,
-                                 mp_context=mp.get_context('spawn')) as executor:
-            futures = {executor.submit(_collect_one_circuit, job): job for job in jobs}
+        # Each job runs as a fresh subprocess — avoids fork/spawn deadlocks with
+        # OR-Tools + PyTorch. ThreadPoolExecutor manages concurrency (threads only
+        # wait on subprocess I/O, no GIL issue).
+        script = os.path.abspath(__file__)
+        bench  = os.path.abspath(args.benchmark_base)
+        job_infos = []
+        for circuit_name, seed in job_pairs:
+            tmp_dir = os.path.join(args.data_dir, f'_tmp_{circuit_name}_s{seed}')
+            os.makedirs(tmp_dir, exist_ok=True)
+            cmd = [
+                sys.executable, script,
+                '--mode', 'collect',
+                '--benchmark_base', bench,
+                '--circuits', circuit_name,
+                '--n_iterations', str(args.n_iterations),
+                '--seed', str(seed),
+                '--n_seeds', '1',
+                '--n_workers', '1',   # single-job subprocess, no recursion
+                '--data_dir', tmp_dir,
+                '--subset_size',      str(args.subset_size),
+                '--window_fraction',  str(args.window_fraction),
+                '--cpsat_time_limit', str(args.cpsat_time_limit),
+            ]
+            job_infos.append((circuit_name, seed, tmp_dir, cmd))
+
+        n_concurrent = min(args.n_workers, len(job_infos))
+        with ThreadPoolExecutor(max_workers=n_concurrent) as tex:
+            futures = {tex.submit(_run_subprocess_job, ji): ji for ji in job_infos}
             for future in as_completed(futures):
-                try:
-                    circuit_name, seed, instances, msg = future.result()
-                    print(f"  [{circuit_name} seed={seed}] {msg}", flush=True)
-                    all_instances.extend(instances)
-                except Exception as e:
-                    job = futures[future]
-                    print(f"  ERROR [{job[0]} seed={job[1]}]: {e}", flush=True)
+                circuit_name, seed, instances, msg = future.result()
+                print(f"  [{circuit_name} seed={seed}] {msg}", flush=True)
+                all_instances.extend(instances)
+
+        for _, _, tmp_dir, _ in job_infos:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     out_path = os.path.join(args.data_dir, 'instances.pt')
     torch.save(all_instances, out_path)
