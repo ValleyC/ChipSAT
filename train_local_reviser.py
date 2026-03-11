@@ -418,12 +418,15 @@ def train(args):
     best_loss = float('inf')
     ckpt = os.path.join(args.save_dir, 'local_reviser_best.pt')
 
+    log_interval = max(1, len(instances) // 5)  # print ~5 times per epoch
+
     for epoch in range(args.epochs):
         perm = np.random.permutation(len(instances))
         total_disp = total_trust = total_w = 0.0
         model.train()
+        t_epoch = time.time()
 
-        for idx in perm:
+        for step, idx in enumerate(perm):
             inst = instances[int(idx)]
             nf       = torch.from_numpy(inst['node_features']).float().to(device)
             ei       = torch.from_numpy(inst['edge_index']).long().to(device)
@@ -452,16 +455,23 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            total_disp  += float(disp_loss) * w
-            total_trust += float(trust_loss) * w
+            total_disp  += disp_loss.item() * w
+            total_trust += trust_loss.item() * w
             total_w     += w
+
+            if (step + 1) % log_interval == 0:
+                avg_d = total_disp  / max(total_w, 1e-8)
+                avg_t = total_trust / max(total_w, 1e-8)
+                print(f"  Epoch {epoch+1}/{args.epochs} [{step+1}/{len(instances)}]  "
+                      f"disp={avg_d:.6f}  trust={avg_t:.6f}", flush=True)
 
         avg_disp  = total_disp  / max(total_w, 1e-8)
         avg_trust = total_trust / max(total_w, 1e-8)
         total_loss = avg_disp + 0.5 * avg_trust
 
         print(f"Epoch {epoch+1:4d}/{args.epochs}  "
-              f"disp={avg_disp:.6f}  trust={avg_trust:.6f}  total={total_loss:.6f}")
+              f"disp={avg_disp:.6f}  trust={avg_trust:.6f}  total={total_loss:.6f}  "
+              f"({time.time()-t_epoch:.1f}s)", flush=True)
 
         if total_loss < best_loss:
             best_loss = total_loss
