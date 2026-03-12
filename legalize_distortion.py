@@ -84,42 +84,70 @@ def run_distortion_experiment(circuit, benchmark_base, noise_sigmas,
             hpwl_legal = compute_net_hpwl(legal, sizes, nets)
             _, ov_legal = check_overlap(legal, sizes)
 
-            # Mean displacement from noisy → legal (how much did CP-SAT move things)
-            disp_legal = float(np.abs(legal - noisy).mean())
-            # Mean displacement from reference → legal (total distortion)
-            disp_ref   = float(np.abs(legal - positions).mean())
+            # ── displacement metrics (noisy → legal) ──────────────────────────
+            per_macro_disp = np.sqrt(((legal - noisy) ** 2).sum(axis=1))  # (N,)
+            disp_mean   = float(per_macro_disp.mean())
+            disp_max    = float(per_macro_disp.max())
+            disp_p90    = float(np.percentile(per_macro_disp, 90))
+            # fraction of macros displaced more than σ (the noise level itself)
+            frac_moved_gt_sigma = float((per_macro_disp > sigma).mean())
+            # fraction displaced more than one full window (wf=0.10)
+            frac_moved_gt_wf    = float((per_macro_disp > 0.10).mean())
+
+            # ── topology preservation (reference → legal) ─────────────────────
+            # Spearman rank correlation of x and y coordinates separately.
+            # 1.0 = perfect order preserved, 0 = random, -1 = reversed.
+            from scipy.stats import spearmanr
+            rho_x = float(spearmanr(positions[:, 0], legal[:, 0]).statistic)
+            rho_y = float(spearmanr(positions[:, 1], legal[:, 1]).statistic)
+
+            # total distortion from reference baseline
+            disp_ref = float(np.sqrt(((legal - positions) ** 2).sum(axis=1)).mean())
 
             trial_results.append({
-                'sigma':       float(sigma),
-                'trial':       trial,
-                'hpwl_ref':    float(ref_hpwl),
-                'hpwl_noisy':  float(hpwl_noisy),
-                'hpwl_legal':  float(hpwl_legal),
-                'ratio_noisy': float(hpwl_noisy / ref_hpwl),
-                'ratio_legal': float(hpwl_legal / ref_hpwl),
-                'ov_noisy':    int(ov_noisy),
-                'ov_legal':    int(ov_legal),
-                'disp_legal':  disp_legal,
-                'disp_ref':    disp_ref,
+                'sigma':              float(sigma),
+                'trial':              trial,
+                'hpwl_ref':           float(ref_hpwl),
+                'hpwl_noisy':         float(hpwl_noisy),
+                'hpwl_legal':         float(hpwl_legal),
+                'ratio_noisy':        float(hpwl_noisy / ref_hpwl),
+                'ratio_legal':        float(hpwl_legal / ref_hpwl),
+                'ov_noisy':           int(ov_noisy),
+                'ov_legal':           int(ov_legal),
+                'disp_mean':          disp_mean,
+                'disp_max':           disp_max,
+                'disp_p90':           disp_p90,
+                'frac_moved_gt_sigma':frac_moved_gt_sigma,
+                'frac_moved_gt_wf':   frac_moved_gt_wf,
+                'spearman_x':         rho_x,
+                'spearman_y':         rho_y,
+                'disp_ref':           disp_ref,
             })
             print(f"  σ={sigma:.3f} t={trial}: "
-                  f"noisy={hpwl_noisy:.3f} ({hpwl_noisy/ref_hpwl:.3f}x)  "
-                  f"legal={hpwl_legal:.3f} ({hpwl_legal/ref_hpwl:.3f}x)  "
-                  f"ov_in={ov_noisy} ov_out={ov_legal}  "
-                  f"disp={disp_legal:.4f}")
+                  f"noisy={hpwl_noisy/ref_hpwl:.3f}x  "
+                  f"legal={hpwl_legal/ref_hpwl:.3f}x  "
+                  f"disp_mean={disp_mean:.4f} max={disp_max:.4f} p90={disp_p90:.4f}  "
+                  f"moved>σ={frac_moved_gt_sigma:.1%}  "
+                  f"ρx={rho_x:.3f} ρy={rho_y:.3f}")
 
         if trial_results:
-            # Average across trials
+            def _avg(key): return float(np.mean([r[key] for r in trial_results]))
             avg = {
-                'sigma':       float(sigma),
-                'hpwl_ref':    float(ref_hpwl),
-                'hpwl_noisy':  float(np.mean([r['hpwl_noisy'] for r in trial_results])),
-                'hpwl_legal':  float(np.mean([r['hpwl_legal'] for r in trial_results])),
-                'ratio_noisy': float(np.mean([r['ratio_noisy'] for r in trial_results])),
-                'ratio_legal': float(np.mean([r['ratio_legal'] for r in trial_results])),
-                'ov_noisy':    float(np.mean([r['ov_noisy']   for r in trial_results])),
-                'disp_legal':  float(np.mean([r['disp_legal'] for r in trial_results])),
-                'disp_ref':    float(np.mean([r['disp_ref']   for r in trial_results])),
+                'sigma':               float(sigma),
+                'hpwl_ref':            float(ref_hpwl),
+                'hpwl_noisy':          _avg('hpwl_noisy'),
+                'hpwl_legal':          _avg('hpwl_legal'),
+                'ratio_noisy':         _avg('ratio_noisy'),
+                'ratio_legal':         _avg('ratio_legal'),
+                'ov_noisy':            _avg('ov_noisy'),
+                'disp_mean':           _avg('disp_mean'),
+                'disp_max':            _avg('disp_max'),
+                'disp_p90':            _avg('disp_p90'),
+                'frac_moved_gt_sigma': _avg('frac_moved_gt_sigma'),
+                'frac_moved_gt_wf':    _avg('frac_moved_gt_wf'),
+                'spearman_x':          _avg('spearman_x'),
+                'spearman_y':          _avg('spearman_y'),
+                'disp_ref':            _avg('disp_ref'),
             }
             results.append(avg)
 
@@ -127,13 +155,20 @@ def run_distortion_experiment(circuit, benchmark_base, noise_sigmas,
 
 
 def plot_results(results, circuit, ref_hpwl, output_dir):
-    sigmas      = [r['sigma']       for r in results]
-    ratio_noisy = [r['ratio_noisy'] for r in results]
-    ratio_legal = [r['ratio_legal'] for r in results]
-    disp_legal  = [r['disp_legal']  for r in results]
-    ov_noisy    = [r['ov_noisy']    for r in results]
+    sigmas               = [r['sigma']               for r in results]
+    ratio_noisy          = [r['ratio_noisy']          for r in results]
+    ratio_legal          = [r['ratio_legal']          for r in results]
+    disp_mean            = [r['disp_mean']            for r in results]
+    disp_max             = [r['disp_max']             for r in results]
+    disp_p90             = [r['disp_p90']             for r in results]
+    frac_gt_sigma        = [r['frac_moved_gt_sigma']  for r in results]
+    frac_gt_wf           = [r['frac_moved_gt_wf']     for r in results]
+    spearman_x           = [r['spearman_x']           for r in results]
+    spearman_y           = [r['spearman_y']           for r in results]
+    ov_noisy             = [r['ov_noisy']             for r in results]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.flatten()
     fig.patch.set_facecolor(BG_DARK)
 
     def _style(ax, xlabel, ylabel, title):
@@ -150,26 +185,63 @@ def plot_results(results, circuit, ref_hpwl, output_dir):
     # Panel 1: HPWL ratio vs sigma
     ax = axes[0]
     ax.plot(sigmas, ratio_noisy, 'o--', color='#f4a261', lw=1.8,
-            label='Noisy (pre-legal, target for ML)')
+            label='Noisy input (ML target)')
     ax.plot(sigmas, ratio_legal, 's-',  color='#e94560', lw=1.8,
             label='After CP-SAT legalize')
-    ax.axhline(1.0, color='white', lw=1, ls=':', alpha=0.6, label='Reference (1.0×)')
+    ax.axhline(1.0, color='white', lw=1, ls=':', alpha=0.6, label='Reference')
     ax.legend(fontsize=8, facecolor=BG_DARK, labelcolor='white')
-    _style(ax, 'Noise σ (fraction of chip)', 'HPWL / reference HPWL',
-           'HPWL distortion from legalization')
+    _style(ax, 'Noise σ', 'HPWL / ref', 'HPWL: before vs after legalization')
 
-    # Panel 2: Mean displacement legalize induced vs sigma
+    # Panel 2: Displacement distribution vs sigma
     ax = axes[1]
-    ax.plot(sigmas, disp_legal, 's-', color='#a8dadc', lw=1.8)
-    ax.axhline(0, color='white', lw=0.5, ls=':', alpha=0.4)
-    _style(ax, 'Noise σ', 'Mean |Δpos| per macro',
+    ax.plot(sigmas, disp_mean, 'o-',  color='#a8dadc', lw=1.8, label='Mean')
+    ax.plot(sigmas, disp_p90,  's--', color='#ffd700', lw=1.8, label='90th pct')
+    ax.plot(sigmas, disp_max,  '^:',  color='#f4a261', lw=1.5, label='Max')
+    ax.plot(sigmas, sigmas,    'w:',  lw=1.0,                   label='σ (noise level)')
+    ax.legend(fontsize=8, facecolor=BG_DARK, labelcolor='white')
+    _style(ax, 'Noise σ', 'Displacement (fraction of chip)',
            'How far does CP-SAT move macros\nto fix overlaps?')
 
-    # Panel 3: Overlap pairs in noisy placement
+    # Panel 3: Fraction of macros displaced beyond thresholds
     ax = axes[2]
+    ax.plot(sigmas, frac_gt_sigma, 'o-',  color='#e94560', lw=1.8,
+            label='Displaced > σ (input noise)')
+    ax.plot(sigmas, frac_gt_wf,   's--', color='#f4a261', lw=1.8,
+            label='Displaced > wf=0.10 (one full window)')
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=8, facecolor=BG_DARK, labelcolor='white')
+    _style(ax, 'Noise σ', 'Fraction of macros',
+           'What fraction of macros get moved\nmore than the noise level?')
+
+    # Panel 4: Topology preservation — Spearman rank correlation
+    ax = axes[3]
+    ax.plot(sigmas, spearman_x, 'o-',  color='#a8dadc', lw=1.8, label='ρ(x)')
+    ax.plot(sigmas, spearman_y, 's--', color='#e94560', lw=1.8, label='ρ(y)')
+    ax.axhline(1.0, color='white', lw=0.8, ls=':', alpha=0.5)
+    ax.axhline(0.0, color='white', lw=0.8, ls=':', alpha=0.3)
+    ax.set_ylim(-0.1, 1.05)
+    ax.legend(fontsize=8, facecolor=BG_DARK, labelcolor='white')
+    _style(ax, 'Noise σ', 'Spearman ρ (ref vs legal)',
+           'Topology preservation:\ndoes relative macro ordering survive legalization?')
+
+    # Panel 5: Overlap count in noisy input
+    ax = axes[4]
     ax.plot(sigmas, ov_noisy, 'o--', color='#ffd700', lw=1.8)
-    _style(ax, 'Noise σ', 'Overlapping macro pairs',
-           'Overlap count in noisy placement\n(input to legalization)')
+    _style(ax, 'Noise σ', 'Overlapping pairs',
+           'Overlap count in noisy input\n(legalization workload)')
+
+    # Panel 6: HPWL gap closed (how much does legalization recover?)
+    gap_closed = [
+        (r['ratio_noisy'] - r['ratio_legal']) / max(r['ratio_noisy'] - 1.0, 1e-8)
+        for r in results
+    ]
+    ax = axes[5]
+    ax.plot(sigmas, gap_closed, 'o-', color='#a8dadc', lw=1.8)
+    ax.axhline(0.0, color='white', lw=0.8, ls=':', alpha=0.4)
+    ax.axhline(1.0, color='white', lw=0.8, ls=':', alpha=0.4)
+    _style(ax, 'Noise σ', 'Fraction of HPWL gap recovered',
+           'Does legalization recover HPWL lost to noise?\n'
+           '(1.0 = fully recovers, 0 = makes it worse)')
 
     plt.suptitle(
         f'Legalization distortion — {circuit}  |  '
@@ -214,13 +286,15 @@ def main():
     print(f"Raw results → {json_out}")
 
     # Summary table
-    print(f"\n{'σ':>6}  {'HPWL_noisy/ref':>14}  {'HPWL_legal/ref':>14}  "
-          f"{'ov_noisy':>8}  {'disp_legal':>10}")
-    print('-' * 62)
+    print(f"\n{'σ':>6}  {'noisy/ref':>9}  {'legal/ref':>9}  "
+          f"{'disp_mean':>9}  {'disp_p90':>8}  {'moved>σ':>7}  "
+          f"{'ρx':>6}  {'ρy':>6}")
+    print('-' * 75)
     for r in results:
-        print(f"{r['sigma']:6.3f}  {r['ratio_noisy']:14.3f}  "
-              f"{r['ratio_legal']:14.3f}  {r['ov_noisy']:8.0f}  "
-              f"{r['disp_legal']:10.4f}")
+        print(f"{r['sigma']:6.3f}  {r['ratio_noisy']:9.3f}  "
+              f"{r['ratio_legal']:9.3f}  {r['disp_mean']:9.4f}  "
+              f"{r['disp_p90']:8.4f}  {r['frac_moved_gt_sigma']:7.1%}  "
+              f"{r['spearman_x']:6.3f}  {r['spearman_y']:6.3f}")
 
     plot_results(results, args.circuit, ref_hpwl, args.output_dir)
 
