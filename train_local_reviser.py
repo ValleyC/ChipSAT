@@ -668,7 +668,7 @@ def eval_mode(args):
     os.makedirs(args.save_dir, exist_ok=True)
     out_path = os.path.join(args.save_dir, f'ablation_{args.circuit}.json')
     with open(out_path, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=lambda x: float(x) if hasattr(x, '__float__') else str(x))
     print(f"\nSaved ablation results → {out_path}")
 
 
