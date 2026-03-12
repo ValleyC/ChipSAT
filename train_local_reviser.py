@@ -608,7 +608,7 @@ def eval_mode(args):
     if ov_pairs > 0:
         print(f"Legalizing ({ov_pairs} overlapping pairs)...")
         positions = legalize(
-            positions, sizes, time_limit=60.0,
+            positions, sizes, time_limit=300.0,
             window_fraction=0.3, num_workers=4)
         if positions is None:
             print("ERROR: legalization failed")
