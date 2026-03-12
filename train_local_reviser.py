@@ -497,6 +497,8 @@ def run_condition(
     seed: int = 42,
 ) -> dict:
     """Run one wall-clock-bounded condition and return metrics."""
+    # uniform_shrink uses half the window fraction globally — no ML involved.
+    effective_wf = window_fraction / 2.0 if condition == 'uniform_shrink' else window_fraction
     solver = LNSSolver(
         positions=positions_init.copy(),
         sizes=sizes,
@@ -504,7 +506,7 @@ def run_condition(
         edge_index=edge_index,
         congestion_weight=0.0,
         subset_size=subset_size,
-        window_fraction=window_fraction,
+        window_fraction=effective_wf,
         cpsat_time_limit=cpsat_time_limit,
         plateau_threshold=20,
         adapt_threshold=30,
@@ -527,7 +529,7 @@ def run_condition(
         hint_pos       = None
         per_macro_wins = None
 
-        if condition != 'pure':
+        if condition not in ('pure', 'uniform_shrink'):
             inst = extract_local_instance(
                 pre_pos, pre_pos,  # post=pre: targets unused at inference time
                 subset, sizes, nets, window_fraction,
@@ -541,15 +543,25 @@ def run_condition(
                     hint_pos[gidx, 0] = pre_pos[gidx, 0] + disp_local[k, 0] * local_scale
                     hint_pos[gidx, 1] = pre_pos[gidx, 1] + disp_local[k, 1] * local_scale
                 if condition == 'hint_plus_trust':
-                    per_macro_wins = np.full(len(pre_pos), window_fraction, dtype=np.float64)
+                    per_macro_wins = np.full(len(pre_pos), effective_wf, dtype=np.float64)
                     for k, gidx in enumerate(subset):
-                        per_macro_wins[gidx] = float(trust_local[k]) * window_fraction
+                        per_macro_wins[gidx] = float(trust_local[k]) * effective_wf
 
             elif condition == 'trust_only' and model is not None:
                 _, trust_local = _gnn_inference(model, inst, device)
-                per_macro_wins = np.full(len(pre_pos), window_fraction, dtype=np.float64)
+                per_macro_wins = np.full(len(pre_pos), effective_wf, dtype=np.float64)
                 for k, gidx in enumerate(subset):
-                    per_macro_wins[gidx] = float(trust_local[k]) * window_fraction
+                    per_macro_wins[gidx] = float(trust_local[k]) * effective_wf
+
+            elif condition == 'degree_trust':
+                # Heuristic baseline: trust radius inversely proportional to
+                # normalized local degree. High connectivity → tight search.
+                K = inst['n_movable']
+                degree_norm = inst['node_features'][:K, 5]  # normalized degree, movable nodes
+                per_macro_wins = np.full(len(pre_pos), effective_wf, dtype=np.float64)
+                for k, gidx in enumerate(subset):
+                    trust = float(np.clip(1.0 - degree_norm[k], 0.1, 1.0))
+                    per_macro_wins[gidx] = trust * effective_wf
 
             elif condition == 'random_hints':
                 hint_pos = pre_pos.copy()
@@ -561,7 +573,7 @@ def run_condition(
         res_guided = solve_subset_guided(
             solver.current_pos, sizes, nets, subset,
             time_limit=cpsat_time_limit,
-            window_fraction=window_fraction,
+            window_fraction=effective_wf,
             hint_positions=hint_pos,
             per_macro_windows=per_macro_wins,
         )
@@ -629,7 +641,7 @@ def eval_mode(args):
     else:
         print(f"No checkpoint at {ckpt} — ML conditions will behave like pure/random")
 
-    conditions = ['pure', 'random_hints', 'hint_only', 'trust_only', 'hint_plus_trust']
+    conditions = ['pure', 'uniform_shrink', 'degree_trust', 'trust_only', 'hint_plus_trust']
     results = []
 
     for cond in conditions:
