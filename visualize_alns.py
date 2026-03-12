@@ -130,7 +130,7 @@ def draw_nets(ax, positions, nets, top_k=40, alpha=0.12):
         if len(idxs) < 2:
             continue
         pts = positions[idxs]
-        span = float(pts[:, 0].ptp() + pts[:, 1].ptp())
+        span = float((pts[:, 0].max() - pts[:, 0].min()) + (pts[:, 1].max() - pts[:, 1].min()))
         spans.append((span, idxs))
     spans.sort(key=lambda x: -x[0])
     for _, idxs in spans[:top_k]:
@@ -169,8 +169,8 @@ def draw_arrows(ax, pre_pos, post_pos, subset):
 
 def _setup_ax(ax, positions, sizes, title='', margin=0.04):
     all_x, all_y = positions[:, 0], positions[:, 1]
-    mx = all_x.ptp() * margin
-    my = all_y.ptp() * margin
+    mx = (all_x.max() - all_x.min()) * margin
+    my = (all_y.max() - all_y.min()) * margin
     ax.set_xlim(all_x.min() - mx, all_x.max() + mx)
     ax.set_ylim(all_y.min() - my, all_y.max() + my)
     ax.set_aspect('equal')
