@@ -293,7 +293,8 @@ def _pool_initializer(sizes, nets):
 
 def _pool_solve_subset(args):
     """Worker function: solve_subset with static sizes/nets from initializer."""
-    positions, subset, time_limit, window_fraction, num_workers = args
+    positions, subset, time_limit, window_fraction, num_workers = args[:5]
+    routing_constraints = args[5] if len(args) > 5 else None
     sizes = _pool_static_data['sizes']
     nets = _pool_static_data['nets']
     return solve_subset(
@@ -301,6 +302,7 @@ def _pool_solve_subset(args):
         time_limit=time_limit,
         window_fraction=window_fraction,
         num_workers=num_workers,
+        routing_constraints=routing_constraints,
     )
 
 
@@ -330,6 +332,7 @@ class LNSSolver:
         n_parallel_candidates: int = 1,
         model=None,
         edge_attr=None,
+        routing_constraints=None,
     ):
         # Hard guard: model requires edge_attr
         if model is not None and edge_attr is None:
@@ -341,6 +344,7 @@ class LNSSolver:
         self.edge_index = edge_index
         self.edge_attr_np = edge_attr  # (E, 4) pin offsets for GNN
         self.congestion_weight = congestion_weight
+        self.routing_constraints = routing_constraints
         self.rng = np.random.default_rng(seed)
 
         # ML model for learned strategy
@@ -349,15 +353,18 @@ class LNSSolver:
         if model is not None:
             self._cache_static_tensors()
 
+        # Precompute net adjacency (macro_nets: which nets each macro belongs to)
+        self._precompute_macro_nets()
+
+        # Build connectivity-based clusters for cluster strategy
+        self._build_clusters()
+
         # Per-strategy tracking — add 'learned' if model present
-        self.strategies = ['random', 'worst_hpwl', 'congestion', 'connected']
+        self.strategies = ['random', 'worst_hpwl', 'congestion', 'connected', 'cluster']
         if model is not None:
             self.strategies.append('learned')
         self.strategy_attempts = {s: 0 for s in self.strategies}
         self.strategy_successes = {s: 0 for s in self.strategies}
-
-        # Precompute net adjacency (macro_nets: which nets each macro belongs to)
-        self._precompute_macro_nets()
 
         # Initialize per-net HPWL cache
         self.net_hpwls = compute_net_hpwl_cached(positions, nets)
@@ -436,6 +443,61 @@ class LNSSolver:
             for (node_idx, _, _) in net:
                 if node_idx < self.N:
                     self.macro_nets[node_idx].append(net_idx)
+
+    def _build_clusters(self):
+        """Build connectivity-based macro clusters using Louvain community detection.
+
+        Sets self.clusters (list of np.array) and self.macro_to_cluster (np.array).
+        """
+        try:
+            import networkx as nx
+            from networkx.algorithms.community import louvain_communities
+        except ImportError:
+            # Fallback: no clustering available
+            self.clusters = [np.arange(self.N)]
+            self.macro_to_cluster = np.zeros(self.N, dtype=int)
+            return
+
+        # Build weighted adjacency: edge weight = number of shared nets
+        G = nx.Graph()
+        G.add_nodes_from(range(self.N))
+        edge_weights = {}
+        for net in self.nets:
+            macros_in_net = [n for n, dx, dy in net if n < self.N]
+            if len(macros_in_net) < 2:
+                continue
+            for i in range(len(macros_in_net)):
+                for j in range(i + 1, len(macros_in_net)):
+                    a, b = macros_in_net[i], macros_in_net[j]
+                    key = (min(a, b), max(a, b))
+                    edge_weights[key] = edge_weights.get(key, 0) + 1
+        for (a, b), w in edge_weights.items():
+            G.add_edge(a, b, weight=w)
+
+        # Louvain with resolution that gives ~10-20 communities
+        # Try resolution=1.0 first, adjust if too many/few
+        communities = louvain_communities(G, weight='weight', resolution=1.0,
+                                          seed=42)
+        communities = [np.array(sorted(c), dtype=int) for c in communities]
+
+        # Sort clusters by size descending
+        communities.sort(key=lambda c: -len(c))
+
+        self.clusters = communities
+        self.macro_to_cluster = np.zeros(self.N, dtype=int)
+        for ci, cluster in enumerate(communities):
+            for m in cluster:
+                self.macro_to_cluster[m] = ci
+
+        # Build cluster adjacency (which clusters share nets)
+        self.cluster_adj = [set() for _ in range(len(communities))]
+        for net in self.nets:
+            macros_in_net = [n for n, dx, dy in net if n < self.N]
+            clusters_in_net = set(int(self.macro_to_cluster[m]) for m in macros_in_net)
+            for ci in clusters_in_net:
+                for cj in clusters_in_net:
+                    if ci != cj:
+                        self.cluster_adj[ci].add(cj)
 
     def _update_macro_hpwl(self, subset_indices=None):
         """Update per-macro HPWL from net_hpwls cache.
@@ -655,6 +717,52 @@ class LNSSolver:
                     visited.add(r)
             return np.array(list(visited), dtype=int)
 
+        elif strategy == 'cluster':
+            # Pick a random cluster, expand to adjacent clusters if needed to reach k
+            n_clusters = len(self.clusters)
+            if n_clusters <= 1:
+                return self.rng.choice(self.N, size=k, replace=False)
+
+            # Score clusters by per-macro HPWL (pick high-HPWL clusters more often)
+            cluster_scores = np.array([
+                self.macro_hpwl[c].mean() for c in self.clusters
+            ])
+            # Add noise for diversity
+            max_s = cluster_scores.max()
+            if max_s > 0:
+                cluster_scores += self.rng.uniform(0, max_s * 0.3, size=n_clusters)
+            # Weighted selection of seed cluster
+            probs = cluster_scores / cluster_scores.sum()
+            seed_ci = int(self.rng.choice(n_clusters, p=probs))
+
+            # Collect macros: start with seed cluster, add adjacent clusters until >= k
+            collected = set(self.clusters[seed_ci].tolist())
+            visited_clusters = {seed_ci}
+            frontier_clusters = list(self.cluster_adj[seed_ci])
+            self.rng.shuffle(frontier_clusters)
+
+            while len(collected) < k and frontier_clusters:
+                next_ci = frontier_clusters.pop(0)
+                if next_ci in visited_clusters:
+                    continue
+                visited_clusters.add(next_ci)
+                collected.update(self.clusters[next_ci].tolist())
+                # Add neighbors of this cluster
+                for adj_ci in self.cluster_adj[next_ci]:
+                    if adj_ci not in visited_clusters:
+                        frontier_clusters.append(adj_ci)
+
+            result = np.array(sorted(collected), dtype=int)
+            # Trim to k if we overshot
+            if len(result) > k:
+                result = self.rng.choice(result, size=k, replace=False)
+            # Pad if undershot
+            elif len(result) < k:
+                remaining = np.setdiff1d(np.arange(self.N), result)
+                pad = self.rng.choice(remaining, size=k - len(result), replace=False)
+                result = np.concatenate([result, pad])
+            return result
+
         elif strategy == 'learned' and self.model is not None:
             import torch
             node_features = self._build_gnn_features()
@@ -702,6 +810,7 @@ class LNSSolver:
             self.current_pos, self.sizes, self.nets, subset,
             time_limit=self.cpsat_time_limit,
             window_fraction=self.window_fraction,
+            routing_constraints=self.routing_constraints,
         )
 
         dt = time.time() - t0
@@ -763,7 +872,7 @@ class LNSSolver:
         futures = []
         for subset in subsets:
             args = (self.current_pos, subset, self.cpsat_time_limit,
-                    self.window_fraction, 1)
+                    self.window_fraction, 1, self.routing_constraints)
             futures.append(pool.submit(_pool_solve_subset, args))
 
         # Collect results

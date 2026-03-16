@@ -44,6 +44,7 @@ def legalize(
     window_fraction: float = 0.3,
     num_workers: int = 4,
     minimize_displacement: bool = True,
+    routing_constraints: Optional[Dict] = None,
 ) -> Optional[np.ndarray]:
     """
     CP-SAT legalization: place all macros without overlap or boundary violation.
@@ -75,6 +76,10 @@ def legalize(
     hint_xs = []
     hint_ys = []
 
+    # Routing constraint padding
+    rc = routing_constraints
+    margin = rc['boundary_margin_int'] if rc else 0
+
     for i in range(N):
         cx_int = _to_int(positions[i, 0])
         cy_int = _to_int(positions[i, 1])
@@ -83,11 +88,11 @@ def legalize(
         bl_x = cx_int - w_int[i] // 2
         bl_y = cy_int - h_int[i] // 2
 
-        # Window constraints + boundary
-        x_lo = max(0, bl_x - window)
-        x_hi = min(SCALE - w_int[i], bl_x + window)
-        y_lo = max(0, bl_y - window)
-        y_hi = min(SCALE - h_int[i], bl_y + window)
+        # Window constraints + boundary (with routing margin)
+        x_lo = max(margin, bl_x - window)
+        x_hi = min(SCALE - w_int[i] - margin, bl_x + window)
+        y_lo = max(margin, bl_y - window)
+        y_hi = min(SCALE - h_int[i] - margin, bl_y + window)
 
         if x_lo > x_hi:
             x_lo, x_hi = 0, max(0, SCALE - w_int[i])
@@ -105,14 +110,29 @@ def legalize(
         hint_xs.append(hint_x)
         hint_ys.append(hint_y)
 
-        # Interval variables for NoOverlap2D
-        x_end = model.new_int_var(x_lo + w_int[i], x_hi + w_int[i], f'xe_{i}')
-        y_end = model.new_int_var(y_lo + h_int[i], y_hi + h_int[i], f'ye_{i}')
-        model.add(x_end == x + w_int[i])
-        model.add(y_end == y + h_int[i])
+        # Per-macro routing padding for inflated intervals
+        if rc is not None:
+            pl, pr, pb, pt = int(rc['pad_int'][i, 0]), int(rc['pad_int'][i, 1]), \
+                             int(rc['pad_int'][i, 2]), int(rc['pad_int'][i, 3])
+        else:
+            pl = pr = pb = pt = 0
 
-        xi = model.new_interval_var(x, w_int[i], x_end, f'xi_{i}')
-        yi = model.new_interval_var(y, h_int[i], y_end, f'yi_{i}')
+        # Interval variables for NoOverlap2D (inflated by routing padding)
+        w_padded = w_int[i] + pl + pr
+        h_padded = h_int[i] + pb + pt
+
+        x_pad_start = model.new_int_var(x_lo - pl, x_hi - pl, f'xps_{i}')
+        model.add(x_pad_start == x - pl)
+        x_pad_end = model.new_int_var(x_lo + w_padded - pl, x_hi + w_padded - pl, f'xpe_{i}')
+        model.add(x_pad_end == x_pad_start + w_padded)
+
+        y_pad_start = model.new_int_var(y_lo - pb, y_hi - pb, f'yps_{i}')
+        model.add(y_pad_start == y - pb)
+        y_pad_end = model.new_int_var(y_lo + h_padded - pb, y_hi + h_padded - pb, f'ype_{i}')
+        model.add(y_pad_end == y_pad_start + h_padded)
+
+        xi = model.new_interval_var(x_pad_start, w_padded, x_pad_end, f'xi_{i}')
+        yi = model.new_interval_var(y_pad_start, h_padded, y_pad_end, f'yi_{i}')
         x_intervals.append(xi)
         y_intervals.append(yi)
 
@@ -166,6 +186,7 @@ def solve_subset(
     time_limit: float = 5.0,
     window_fraction: float = 0.15,
     num_workers: int = 4,
+    routing_constraints: Optional[Dict] = None,
 ) -> Optional[np.ndarray]:
     """
     Solve LNS subproblem: optimize net-level HPWL for subset macros.
@@ -194,11 +215,20 @@ def solve_subset(
 
     window = int(round(window_fraction * SCALE))
 
+    # Routing constraint padding
+    rc = routing_constraints
+    margin = rc['boundary_margin_int'] if rc else 0
+    # Max padding in float space for spatial filter expansion
+    if rc is not None:
+        max_pad_float = float(rc['pad_int'].max()) / SCALE * 2.0
+    else:
+        max_pad_float = 0.0
+
     # Spatial filter: only include frozen macros that could overlap with
     # some subset macro after movement. Reduces NoOverlap2D constraint size.
     # Note: window in int space = window_fraction * SCALE, which maps to
-    # 2 * window_fraction in float [-1,1] space. Add safety margin.
-    float_window = 2.0 * window_fraction + 0.01  # extra margin for int rounding
+    # 2 * window_fraction in float [-1,1] space. Add safety margin + padding.
+    float_window = 2.0 * window_fraction + 0.01 + max_pad_float
     sub_pos = positions[subset_indices]  # (K, 2)
     sub_sizes = sizes[subset_indices]    # (K, 2)
     frozen_mask = np.ones(N, dtype=bool)
@@ -235,41 +265,57 @@ def solve_subset(
         bl_x = cx_int - w_int[i] // 2
         bl_y = cy_int - h_int[i] // 2
 
+        # Per-macro routing padding
+        if rc is not None:
+            pl, pr, pb, pt = int(rc['pad_int'][i, 0]), int(rc['pad_int'][i, 1]), \
+                             int(rc['pad_int'][i, 2]), int(rc['pad_int'][i, 3])
+        else:
+            pl = pr = pb = pt = 0
+
         if i in subset_set:
-            # Movable: create variables with window constraint
-            x_lo = max(0, bl_x - window)
-            x_hi = min(SCALE - w_int[i], bl_x + window)
-            y_lo = max(0, bl_y - window)
-            y_hi = min(SCALE - h_int[i], bl_y + window)
+            # Movable: create variables with window constraint + boundary margin
+            x_lo = max(margin, bl_x - window)
+            x_hi = min(SCALE - w_int[i] - margin, bl_x + window)
+            y_lo = max(margin, bl_y - window)
+            y_hi = min(SCALE - h_int[i] - margin, bl_y + window)
 
             if x_lo > x_hi:
-                x_lo, x_hi = 0, max(0, SCALE - w_int[i])
+                x_lo, x_hi = margin, max(margin, SCALE - w_int[i] - margin)
             if y_lo > y_hi:
-                y_lo, y_hi = 0, max(0, SCALE - h_int[i])
+                y_lo, y_hi = margin, max(margin, SCALE - h_int[i] - margin)
 
             x = model.new_int_var(x_lo, x_hi, f'x_{i}')
             y = model.new_int_var(y_lo, y_hi, f'y_{i}')
             x_vars[i] = x
             y_vars[i] = y
 
-            x_end = model.new_int_var(x_lo + w_int[i], x_hi + w_int[i], f'xe_{i}')
-            y_end = model.new_int_var(y_lo + h_int[i], y_hi + h_int[i], f'ye_{i}')
-            model.add(x_end == x + w_int[i])
-            model.add(y_end == y + h_int[i])
+            # Inflated intervals for NoOverlap2D (real position + routing padding)
+            w_padded = w_int[i] + pl + pr
+            h_padded = h_int[i] + pb + pt
 
-            xi = model.new_interval_var(x, w_int[i], x_end, f'xi_{i}')
-            yi = model.new_interval_var(y, h_int[i], y_end, f'yi_{i}')
+            x_pad_start = model.new_int_var(x_lo - pl, x_hi - pl, f'xps_{i}')
+            model.add(x_pad_start == x - pl)
+            x_pad_end = model.new_int_var(x_lo + w_padded - pl, x_hi + w_padded - pl, f'xpe_{i}')
+            model.add(x_pad_end == x_pad_start + w_padded)
+
+            y_pad_start = model.new_int_var(y_lo - pb, y_hi - pb, f'yps_{i}')
+            model.add(y_pad_start == y - pb)
+            y_pad_end = model.new_int_var(y_lo + h_padded - pb, y_hi + h_padded - pb, f'ype_{i}')
+            model.add(y_pad_end == y_pad_start + h_padded)
+
+            xi = model.new_interval_var(x_pad_start, w_padded, x_pad_end, f'xi_{i}')
+            yi = model.new_interval_var(y_pad_start, h_padded, y_pad_end, f'yi_{i}')
 
             # Warm-start hint
             model.add_hint(x, max(x_lo, min(x_hi, bl_x)))
             model.add_hint(y, max(y_lo, min(y_hi, bl_y)))
         else:
-            # Frozen: fixed interval
+            # Frozen: fixed interval (inflated by routing padding)
             bl_x_clamped = max(0, min(SCALE - w_int[i], bl_x))
             bl_y_clamped = max(0, min(SCALE - h_int[i], bl_y))
 
-            xi = model.new_fixed_size_interval_var(bl_x_clamped, w_int[i], f'xi_{i}')
-            yi = model.new_fixed_size_interval_var(bl_y_clamped, h_int[i], f'yi_{i}')
+            xi = model.new_fixed_size_interval_var(bl_x_clamped - pl, w_int[i] + pl + pr, f'xi_{i}')
+            yi = model.new_fixed_size_interval_var(bl_y_clamped - pb, h_int[i] + pb + pt, f'yi_{i}')
 
         x_intervals.append(xi)
         y_intervals.append(yi)
@@ -358,8 +404,26 @@ def solve_subset(
             new_positions[i, 0] = _to_float(bl_x + w_int[i] // 2)
             new_positions[i, 1] = _to_float(bl_y + h_int[i] // 2)
         return new_positions
+    elif status == cp_model.INFEASIBLE and routing_constraints is not None:
+        # Retry with halved padding (up to 3 attempts)
+        reduced_rc = _halve_routing_constraints(routing_constraints)
+        if reduced_rc['pad_int'].max() >= 1:
+            return solve_subset(
+                positions, sizes, nets, subset_indices,
+                time_limit=time_limit, window_fraction=window_fraction,
+                num_workers=num_workers, routing_constraints=reduced_rc,
+            )
+        return None
     else:
         return None
+
+
+def _halve_routing_constraints(rc: Dict) -> Dict:
+    """Halve all padding values for infeasibility retry."""
+    return {
+        'pad_int': rc['pad_int'] // 2,
+        'boundary_margin_int': rc['boundary_margin_int'] // 2,
+    }
 
 
 def solve_subset_guided(
@@ -372,6 +436,7 @@ def solve_subset_guided(
     hint_positions: Optional[np.ndarray] = None,
     per_macro_windows: Optional[np.ndarray] = None,
     num_workers: int = 4,
+    routing_constraints: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Guided LNS subproblem: like solve_subset but with per-macro hints,
@@ -407,6 +472,10 @@ def solve_subset_guided(
     w_int = [_size_to_int(sizes[i, 0]) for i in range(N)]
     h_int = [_size_to_int(sizes[i, 1]) for i in range(N)]
 
+    # Routing constraint padding
+    rc = routing_constraints
+    margin = rc['boundary_margin_int'] if rc else 0
+
     x_vars: Dict[int, Any] = {}
     y_vars: Dict[int, Any] = {}
     x_intervals = []
@@ -418,6 +487,13 @@ def solve_subset_guided(
         bl_x = cx_int - w_int[i] // 2
         bl_y = cy_int - h_int[i] // 2
 
+        # Per-macro routing padding
+        if rc is not None:
+            pl, pr, pb, pt = int(rc['pad_int'][i, 0]), int(rc['pad_int'][i, 1]), \
+                             int(rc['pad_int'][i, 2]), int(rc['pad_int'][i, 3])
+        else:
+            pl = pr = pb = pt = 0
+
         if i in subset_set:
             # Per-macro or uniform window
             if per_macro_windows is not None:
@@ -426,10 +502,6 @@ def solve_subset_guided(
                 window_i = int(round(window_fraction * SCALE))
 
             # Domain center: hint position when provided, else current position.
-            # This is the critical difference from solve_subset: when hint_positions
-            # is given, the trust region is centered around the hint (not current pos),
-            # so CP-SAT searches in [hint - window, hint + window] instead of
-            # [current - window, current + window].
             if hint_positions is not None:
                 hint_cx = _to_int(float(hint_positions[i, 0]))
                 hint_cy = _to_int(float(hint_positions[i, 1]))
@@ -439,28 +511,37 @@ def solve_subset_guided(
                 center_bl_x = bl_x
                 center_bl_y = bl_y
 
-            x_lo = max(0, center_bl_x - window_i)
-            x_hi = min(SCALE - w_int[i], center_bl_x + window_i)
-            y_lo = max(0, center_bl_y - window_i)
-            y_hi = min(SCALE - h_int[i], center_bl_y + window_i)
+            x_lo = max(margin, center_bl_x - window_i)
+            x_hi = min(SCALE - w_int[i] - margin, center_bl_x + window_i)
+            y_lo = max(margin, center_bl_y - window_i)
+            y_hi = min(SCALE - h_int[i] - margin, center_bl_y + window_i)
 
             if x_lo > x_hi:
-                x_lo, x_hi = 0, max(0, SCALE - w_int[i])
+                x_lo, x_hi = margin, max(margin, SCALE - w_int[i] - margin)
             if y_lo > y_hi:
-                y_lo, y_hi = 0, max(0, SCALE - h_int[i])
+                y_lo, y_hi = margin, max(margin, SCALE - h_int[i] - margin)
 
             x = model.new_int_var(x_lo, x_hi, f'x_{i}')
             y = model.new_int_var(y_lo, y_hi, f'y_{i}')
             x_vars[i] = x
             y_vars[i] = y
 
-            x_end = model.new_int_var(x_lo + w_int[i], x_hi + w_int[i], f'xe_{i}')
-            y_end = model.new_int_var(y_lo + h_int[i], y_hi + h_int[i], f'ye_{i}')
-            model.add(x_end == x + w_int[i])
-            model.add(y_end == y + h_int[i])
+            # Inflated intervals for NoOverlap2D (real position + routing padding)
+            w_padded = w_int[i] + pl + pr
+            h_padded = h_int[i] + pb + pt
 
-            xi = model.new_interval_var(x, w_int[i], x_end, f'xi_{i}')
-            yi = model.new_interval_var(y, h_int[i], y_end, f'yi_{i}')
+            x_pad_start = model.new_int_var(x_lo - pl, x_hi - pl, f'xps_{i}')
+            model.add(x_pad_start == x - pl)
+            x_pad_end = model.new_int_var(x_lo + w_padded - pl, x_hi + w_padded - pl, f'xpe_{i}')
+            model.add(x_pad_end == x_pad_start + w_padded)
+
+            y_pad_start = model.new_int_var(y_lo - pb, y_hi - pb, f'yps_{i}')
+            model.add(y_pad_start == y - pb)
+            y_pad_end = model.new_int_var(y_lo + h_padded - pb, y_hi + h_padded - pb, f'ype_{i}')
+            model.add(y_pad_end == y_pad_start + h_padded)
+
+            xi = model.new_interval_var(x_pad_start, w_padded, x_pad_end, f'xi_{i}')
+            yi = model.new_interval_var(y_pad_start, h_padded, y_pad_end, f'yi_{i}')
 
             # Warm-start at domain center (hint or current)
             model.add_hint(x, max(x_lo, min(x_hi, center_bl_x)))
@@ -468,8 +549,8 @@ def solve_subset_guided(
         else:
             bl_x_clamped = max(0, min(SCALE - w_int[i], bl_x))
             bl_y_clamped = max(0, min(SCALE - h_int[i], bl_y))
-            xi = model.new_fixed_size_interval_var(bl_x_clamped, w_int[i], f'xi_{i}')
-            yi = model.new_fixed_size_interval_var(bl_y_clamped, h_int[i], f'yi_{i}')
+            xi = model.new_fixed_size_interval_var(bl_x_clamped - pl, w_int[i] + pl + pr, f'xi_{i}')
+            yi = model.new_fixed_size_interval_var(bl_y_clamped - pb, h_int[i] + pb + pt, f'yi_{i}')
 
         x_intervals.append(xi)
         y_intervals.append(yi)
